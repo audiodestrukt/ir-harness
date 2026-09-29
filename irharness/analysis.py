@@ -30,23 +30,23 @@ class IRSet:
         return self.ir[1]
 
 
-def deconvolve(stim: Stimulus, y: np.ndarray) -> tuple[np.ndarray, int]:
+def deconvolve(stim: Stimulus, y: np.ndarray, sweep=None) -> tuple[np.ndarray, int]:
     """Convolve the aligned response with the inverse sweep. Returns
     (ir_full, origin) where ir_full[origin] is the linear IR's t=0."""
-    sweep = stim.seg("sweep")
-    inv = stim.inverse()
+    sweep = sweep or stim.ref_sweep()
+    inv = stim.inverse(sweep)
     ir_full = fftconvolve(y, inv)
     origin = sweep.start + sweep.length - 1
     return ir_full, origin
 
 
 def extract_harmonics(ir_full: np.ndarray, origin: int, stim: Stimulus, max_order: int = 5,
-                      ir_seconds: float = 0.2, pre_ms: float = 50.0) -> IRSet:
+                      ir_seconds: float = 0.2, pre_ms: float = 50.0, sweep=None) -> IRSet:
     """Window each order's IR out of the deconvolution. The pre-window matters:
     band-limiting at f1 rings symmetrically around t=0 for ~1/f1 seconds, and
     cutting that off costs low-frequency accuracy. Every order shares one `pre`
     so the IRs stay time-aligned to each other."""
-    sweep = stim.seg("sweep")
+    sweep = sweep or stim.ref_sweep()
     L, fs = sweep.meta["L"], stim.fs
     # the next order above k lands L*ln((k+1)/k) earlier; keep clear of it
     tightest = int(L * np.log((max_order + 1) / max_order) * fs)
@@ -195,4 +195,85 @@ def spike_metrics(stim: Stimulus, y: np.ndarray, factor: float = 2.0) -> dict:
             out["by_segment"][s.name] = {"count": n, "max_ratio": ratio}
             out["count"] += n
             out["max_ratio"] = max(out["max_ratio"], ratio)
+    return out
+
+
+# ------------------------------------------------------------------ bursts
+def _env_db(x: np.ndarray, fs: int, win_s: float = 0.01, freq: float | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Short-time RMS in dB. With `freq`, the window is an integer number of
+    cycles near win_s so a steady tone reads steady."""
+    if freq:
+        w = int(round(max(1, round(win_s * freq)) * fs / freq))
+    else:
+        w = max(1, int(win_s * fs))
+    n = len(x) // w
+    seg = x[: n * w].reshape(n, w)
+    lvl = 20 * np.log10(np.sqrt(np.mean(seg ** 2, axis=1)) + 1e-30)
+    t = (np.arange(n) + 0.5) * w / fs
+    return t, lvl
+
+
+def burst_metrics(stim: Stimulus, y: np.ndarray) -> list[dict]:
+    """Sag and recovery. For the burst: output level over time relative to its
+    first 20 ms (negative = compression setting in). For the probe: level over
+    time relative to its final 300 ms (negative = still recovering)."""
+    fs = stim.fs
+    rows = []
+    for b in stim.segs("burst"):
+        p = next((s for s in stim.segs("probe") if s.meta.get("after") == b.name), None)
+        yb = y[b.start : b.stop]
+        tb, lb = _env_db(yb, fs, freq=b.meta["freq"])
+        start = np.mean(lb[1:3])                      # after the fade-in
+        end = np.median(lb[-31:-1])                   # last ~300 ms, excluding the fade-out window
+        row = {"name": b.name, "freq": b.meta["freq"], "level_db": b.meta["level_db"],
+               "sag_db": float(end - start), "min_db": float(np.min(lb[1:]) - start),
+               "dc_start": float(np.mean(yb[: int(0.05 * fs)])), "dc_end": float(np.mean(yb[-int(0.3 * fs):])),
+               "envelope_t": tb.tolist(), "envelope_db": (lb - start).tolist()}
+        if p is not None:
+            yp = y[p.start : p.stop]
+            tp, lp = _env_db(yp, fs, freq=p.meta["freq"])
+            final = np.median(lp[-31:-1])
+            rel = (lp - final)[:-1]
+            tp = tp[:-1]
+            settled = np.where(np.abs(rel) < 0.5)[0]
+            rec_t = float(tp[settled[0]]) if len(settled) else float(tp[-1])
+            # first index after which it stays within 0.5 dB
+            for i in range(len(rel)):
+                if np.all(np.abs(rel[i:]) < 0.5):
+                    rec_t = float(tp[i]); break
+            row.update({"probe": p.name, "probe_deficit_db": float(rel[1]), "recovery_s": rec_t,
+                        "probe_envelope_t": tp.tolist(), "probe_envelope_db": rel.tolist()})
+        rows.append(row)
+    return rows
+
+
+# -------------------------------------------------------------- knob ramps
+def ramp_metrics(stim: Stimulus, y: np.ndarray, schedule: dict, win_s: float = 0.05, max_order: int = 10) -> list[dict]:
+    """For every ramp segment a parameter moves across: short-time level, DC,
+    THD and harmonics of the tone against the parameter's value."""
+    from .controls import value_at
+    fs = stim.fs
+    out = []
+    for s in stim.segs("ramp"):
+        f = s.meta["freq"]
+        w = int(round(max(1, round(win_s * f)) * fs / f))
+        n = (s.length // w)
+        t_abs = s.start / fs + (np.arange(n) + 0.5) * w / fs
+        moving = {name: value_at(pts, t_abs) for name, pts in schedule.items()
+                  if np.ptp(value_at(pts, np.array([s.start / fs, s.stop / fs]))) > 0}
+        if not moving:
+            continue
+        seg = y[s.start : s.start + n * w].reshape(n, w)
+        tw = np.arange(w) / fs
+        basis = [np.exp(-2j * np.pi * k * f * tw) for k in range(1, max_order + 1) if k * f < fs / 2]
+        rows = []
+        for i in range(n):
+            amps = np.array([2 * abs(np.mean(seg[i] * b)) for b in basis])
+            fund = amps[0]
+            rows.append({"t": float(t_abs[i]), **{k: float(v[i]) for k, v in moving.items()},
+                         "out_rms_db": float(20 * np.log10(rms(seg[i]) + 1e-30)), "dc": float(seg[i].mean()),
+                         "thd": float(np.sqrt(np.sum(amps[1:] ** 2)) / fund) if fund > 0 else float("nan"),
+                         "h2_db": float(20 * np.log10(amps[1] / fund + 1e-30)) if fund > 0 and len(amps) > 1 else float("nan"),
+                         "h3_db": float(20 * np.log10(amps[2] / fund + 1e-30)) if fund > 0 and len(amps) > 2 else float("nan")})
+        out.append({"segment": s.name, "freq": f, "level_db": s.meta["level_db"], "params": list(moving), "rows": rows})
     return out

@@ -107,3 +107,45 @@ def test_residual_metrics():
     assert abs(r["ls_gain"] - 2.0) < 1e-9 and r["esr"] < 1e-20
     r = analysis.residual_metrics(a, a + 0.1 * rng.standard_normal(FS), FS)
     assert abs(r["null_depth_db"] - (-20)) < 1.0
+
+
+def test_sweep_model_explains_tanh_at_its_level(stim):
+    from irharness.model import fit_hammerstein
+    from irharness.residual import localize
+    _, ya, irs = _analyze(stim, make_dut("tanh:2"))
+    m = fit_hammerstein(irs, -12.0)
+    rep = localize(stim, ya, m.apply(stim.signal), -12.0)
+    at = {(t["freq"], t["level_db"]): t["rsr_db"] for t in rep["tones"]}
+    assert at[(1000.0, -20.0)] < -40
+    assert at[(1000.0, 0.0)] > -10          # a -12 dBFS model cannot explain a 0 dBFS tone
+
+
+def test_multilevel_sweeps_close_the_level_gap():
+    from irharness.model import fit_hammerstein, LevelIndexedModel
+    from irharness.residual import localize
+    st = build(fs=FS, sweep_seconds=3.0, sweep_dbs=(-30.0, 0.0), tone_dbs=(-20.0, 0.0), tone_freqs=(1000.0,),
+               tone_seconds=0.2, burst_freqs=())
+    assert [s.meta["level_db"] for s in st.sweeps()] == [-30.0, -12.0, 0.0]
+    assert st.ref_sweep().meta["level_db"] == -12.0
+    dut = make_dut("tanh:2")
+    y = dut.run(st.signal, st.fs)
+    al = find_alignment(st, y)
+    ya = apply_alignment(y, al, len(st))
+    models = []
+    for seg in st.sweeps():
+        irf, o = analysis.deconvolve(st, ya, seg)
+        irs = analysis.extract_harmonics(irf, o, st, 5, 0.05, sweep=seg)
+        models.append(fit_hammerstein(irs, seg.meta["level_db"]))
+    ref = next(m for m in models if m.level_db == -12.0)
+    r_ref = localize(st, ya, ref.apply(st.signal), -12.0)
+    r_all = localize(st, ya, LevelIndexedModel(models).apply(st.signal, st.fs), -12.0)
+    t0 = lambda rep: next(t["rsr_db"] for t in rep["tones"] if t["level_db"] == 0.0)
+    assert t0(r_ref) > -10 and t0(r_all) < -20, (t0(r_ref), t0(r_all))
+
+
+def test_burst_metrics_identity(stim):
+    y = make_dut("ident").run(stim.signal, stim.fs)
+    rows = analysis.burst_metrics(stim, y)
+    assert len(rows) == 2
+    for r in rows:
+        assert abs(r["sag_db"]) < 0.05 and abs(r["probe_deficit_db"]) < 0.05 and r["recovery_s"] < 0.03

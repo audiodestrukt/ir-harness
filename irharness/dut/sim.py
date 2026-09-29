@@ -55,13 +55,22 @@ class _TextRenderDUT(DUT):
     def args(self, inp: Path, out: Path, fs: int) -> list[str]:
         raise NotImplementedError
 
-    def run(self, x, fs):
+    supports_controls = False
+
+    def run(self, x, fs, controls=None):
         d = Path(tempfile.mkdtemp(prefix="irh_"))
         try:
             inp, out = d / "in.txt", d / "out.dat"
             _write_input(inp, x, fs, self.volts_per_fs)
+            extra = []
+            if controls:
+                if not self.supports_controls:
+                    raise ValueError(f"{self.spec} has no native automation")
+                from ..controls import write_automation
+                write_automation(d / "auto.txt", controls)
+                extra = ["--automation", str(d / "auto.txt")]
             t0 = time.time()
-            p = subprocess.run(self.args(inp, out, fs), capture_output=True, text=True)
+            p = subprocess.run(self.args(inp, out, fs) + extra, capture_output=True, text=True)
             self.last_seconds = time.time() - t0
             self.last_log = p.stdout + p.stderr
             if p.returncode != 0:
@@ -80,6 +89,7 @@ class _TextRenderDUT(DUT):
 
 class FuzzFaceDUT(_TextRenderDUT):
     binary = BUILD / "ff_render"
+    supports_controls = True   # ff_render --automation: breakpoints applied every 32 samples
 
     def __init__(self, spec, sets, solver="dk", **kw):
         self.solver = solver

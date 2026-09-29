@@ -6,6 +6,8 @@ import numpy as np
 
 
 class DUT(abc.ABC):
+    supports_controls = False   # True if run() accepts controls={param: [(t, v), ...]}
+
     def __init__(self, spec: str):
         self.spec = spec
 

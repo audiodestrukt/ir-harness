@@ -29,8 +29,8 @@ class Alignment:
 
 
 def find_alignment(stim: Stimulus, y: np.ndarray, max_delay_s: float = 2.0, min_delay_s: float = -0.01) -> Alignment:
-    sweep = stim.seg("sweep")
-    inv = stim.inverse()
+    sweep = stim.ref_sweep()
+    inv = stim.inverse(sweep)
     ir_full = fftconvolve(y, inv)
     # identity: peak at sweep.start + sweep.length - 1
     origin = sweep.start + sweep.length - 1

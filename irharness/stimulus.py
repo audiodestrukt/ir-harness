@@ -103,7 +103,22 @@ class Stimulus:
         for s in self.segments:
             if s.name == name:
                 return s
+        if name == "sweep":
+            return self.ref_sweep()
         raise KeyError(name)
+
+    def sweeps(self) -> list[Segment]:
+        return self.segs("sweep")
+
+    def ref_sweep(self) -> Segment:
+        """The sweep alignment and the headline numbers use."""
+        sw = self.sweeps()
+        if not sw:
+            raise KeyError("stimulus has no sweep")
+        for s in sw:
+            if s.meta.get("ref"):
+                return s
+        return sw[0]
 
     def segs(self, kind: str) -> list[Segment]:
         return [s for s in self.segments if s.kind == kind]
@@ -112,8 +127,8 @@ class Stimulus:
         s = self.seg(name)
         return x[s.start : s.stop]
 
-    def inverse(self) -> np.ndarray:
-        s = self.seg("sweep")
+    def inverse(self, sweep: Segment | None = None) -> np.ndarray:
+        s = sweep or self.ref_sweep()
         return ess_inverse(self.fs, s.meta["f1"], s.meta["f2"], s.meta["L"], s.length, s.meta.get("level_db", 0.0))
 
     # persistence -----------------------------------------------------------
@@ -159,6 +174,7 @@ def build(
     f1: float = 20.0,
     f2: float = 20000.0,
     sweep_db: float = -12.0,
+    sweep_dbs: tuple[float, ...] | None = None,
     tone_freqs: tuple[float, ...] = (82.0, 220.0, 440.0, 1000.0, 3000.0),
     tone_dbs: tuple[float, ...] = (-40.0, -32.0, -24.0, -16.0, -8.0, 0.0),
     tone_seconds: float = 0.25,
@@ -166,6 +182,14 @@ def build(
     di: Path | None = None,
     di_db: float = -6.0,
     di_max_seconds: float | None = 20.0,
+    knob_ramp_seconds: float = 4.0,
+    knob_ramp_freq: float = 220.0,
+    knob_ramp_db: float = -12.0,
+    burst_freqs: tuple[float, ...] = (110.0, 1000.0),
+    burst_db: float = 0.0,
+    burst_seconds: float = 1.0,
+    probe_db: float = -30.0,
+    probe_seconds: float = 1.5,
     pre_seconds: float = 0.5,
     tail_seconds: float = 1.0,
     post_seconds: float = 0.5,
@@ -192,11 +216,17 @@ def build(
     add("sync", "sync", raised_cosine_fade(sync, fs, 2, 2) * db(-20), {"level_db": -20})
     silence("sync_gap", 0.2)
 
+    # sweeps: one per level, loudest last so a stateful DUT sees the reference first.
+    # sweep_db is the reference level (alignment, headline numbers); sweep_dbs adds more.
+    levels = sorted(set((sweep_dbs or ()) + (sweep_db,)))
     sweep, L = synchronized_ess(fs, f1, f2, sweep_seconds)
     fade_in_ms = 2000.0 / f1  # two cycles of f1
-    sweep = raised_cosine_fade(sweep, fs, fade_in_ms, 5.0) * db(sweep_db)
-    add("sweep", "sweep", sweep, {"f1": f1, "f2": f2, "L": L, "level_db": sweep_db, "seconds": len(sweep) / fs})
-    silence("tail", tail_seconds)
+    sweep = raised_cosine_fade(sweep, fs, fade_in_ms, 5.0)
+    for lvl in levels:
+        name = "sweep" if len(levels) == 1 else f"sweep_{lvl:g}dB"
+        add(name, "sweep", sweep * db(lvl), {"f1": f1, "f2": f2, "L": L, "level_db": lvl,
+                                            "seconds": len(sweep) / fs, "ref": lvl == sweep_db})
+        silence("tail" if len(levels) == 1 else f"tail_{lvl:g}dB", tail_seconds)
 
     for lvl in tone_dbs:
         for f in tone_freqs:
@@ -205,6 +235,31 @@ def build(
             tone = raised_cosine_fade(np.sin(2 * np.pi * f * t), fs, 10, 10) * db(lvl)
             add(f"tone_{f:g}Hz_{lvl:g}dB", "tone", tone, {"freq": f, "level_db": lvl})
             silence(f"gap_{f:g}Hz_{lvl:g}dB", gap_seconds)
+
+    # knob ramp: a plain sustained tone. It does nothing by itself; a run
+    # attaches a parameter ramp to it (--ramp fuzz:0:1@knob_ramp) and the
+    # analysis then reads distortion and level against knob position.
+    if knob_ramp_seconds > 0:
+        n = int(round(knob_ramp_seconds * fs))
+        t = np.arange(n) / fs
+        add("knob_ramp", "ramp", raised_cosine_fade(np.sin(2 * np.pi * knob_ramp_freq * t), fs, 10, 10) * db(knob_ramp_db),
+            {"freq": knob_ramp_freq, "level_db": knob_ramp_db})
+        silence("knob_ramp_tail", 0.3)
+
+    # tone bursts: silence, a loud tone, then immediately a quiet probe tone.
+    # The burst's own envelope shows sag/compression setting in; the probe's
+    # envelope shows recovery. Nothing else in the stimulus can see either.
+    for f in burst_freqs:
+        silence(f"burst_pre_{f:g}Hz", 0.5)
+        n = int(round(burst_seconds * fs))
+        t = np.arange(n) / fs
+        add(f"burst_{f:g}Hz", "burst", raised_cosine_fade(np.sin(2 * np.pi * f * t), fs, 2, 2) * db(burst_db),
+            {"freq": f, "level_db": burst_db})
+        n = int(round(probe_seconds * fs))
+        t = np.arange(n) / fs
+        add(f"probe_{f:g}Hz", "probe", raised_cosine_fade(np.sin(2 * np.pi * f * t), fs, 2, 10) * db(probe_db),
+            {"freq": f, "level_db": probe_db, "after": f"burst_{f:g}Hz"})
+        silence(f"burst_post_{f:g}Hz", 0.5)
 
     if di is not None:
         clip = load_clip(Path(di), fs)
@@ -218,7 +273,10 @@ def build(
     silence("post", post_seconds)
 
     params = {
-        "fs": fs, "sweep_seconds": sweep_seconds, "f1": f1, "f2": f2, "sweep_db": sweep_db,
+        "fs": fs, "sweep_seconds": sweep_seconds, "f1": f1, "f2": f2, "sweep_db": sweep_db, "sweep_dbs": levels,
+        "burst_freqs": list(burst_freqs), "burst_db": burst_db, "burst_seconds": burst_seconds,
+        "probe_db": probe_db, "probe_seconds": probe_seconds,
+        "knob_ramp_seconds": knob_ramp_seconds, "knob_ramp_freq": knob_ramp_freq, "knob_ramp_db": knob_ramp_db,
         "tone_freqs": list(tone_freqs), "tone_dbs": list(tone_dbs), "tone_seconds": tone_seconds,
         "gap_seconds": gap_seconds, "di": str(di) if di else None, "di_db": di_db,
         "pre_seconds": pre_seconds, "tail_seconds": tail_seconds, "post_seconds": post_seconds,

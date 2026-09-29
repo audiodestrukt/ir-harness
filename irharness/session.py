@@ -18,9 +18,10 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from . import analysis, report
+from . import analysis, report, residual
 from .align import Alignment, apply_alignment, find_alignment, rms, level_match_gain
 from .dut import make_dut
+from .model import LevelIndexedModel, fit_hammerstein
 from .stimulus import Stimulus
 
 
@@ -32,23 +33,27 @@ def _json(o):
     return str(o)
 
 
-def run_dut(stim_dir: Path, spec: str, sets: dict, out: Path, **opts) -> Path:
+def run_dut(stim_dir: Path, spec: str, sets: dict, out: Path, ramps: list[str] | None = None,
+            knob_mode: str = "auto", knob_steps: int = 16, **opts) -> Path:
+    from .controls import parse_ramp, run_with_controls
     stim = Stimulus.load(stim_dir)
     dut = make_dut(spec, sets, **opts)
+    schedule = dict(parse_ramp(r, stim) for r in (ramps or []))
     t0 = time.time()
-    y = dut.run(stim.signal, stim.fs)
+    y = run_with_controls(dut, stim.signal, stim.fs, schedule, mode=knob_mode, steps=knob_steps)
     wall = time.time() - t0
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     sf.write(out / "response.wav", y.astype(np.float32), stim.fs, subtype="FLOAT")
     meta = {"dut": dut.describe(), "stimulus": str(Path(stim_dir).resolve()), "fs": stim.fs,
+            "controls": schedule, "knob_mode": knob_mode if schedule else None,
             "stimulus_seconds": stim.seconds, "response_seconds": len(y) / stim.fs,
             "wall_seconds": wall, "created": datetime.now().isoformat(timespec="seconds")}
     (out / "run.json").write_text(json.dumps(meta, indent=1, default=_json))
     return out
 
 
-def analyze_run(run_dir: Path, max_order: int = 5, ir_seconds: float = 0.2) -> dict:
+def analyze_run(run_dir: Path, max_order: int = 9, ir_seconds: float = 0.2) -> dict:
     run_dir = Path(run_dir)
     meta = json.loads((run_dir / "run.json").read_text())
     stim = Stimulus.load(meta["stimulus"])
@@ -59,21 +64,45 @@ def analyze_run(run_dir: Path, max_order: int = 5, ir_seconds: float = 0.2) -> d
     ya = apply_alignment(y, al, len(stim))
     sf.write(run_dir / "aligned.wav", ya.astype(np.float32), fs, subtype="FLOAT")
 
-    ir_full, origin = analysis.deconvolve(stim, ya)
-    irs = analysis.extract_harmonics(ir_full, origin, stim, max_order, ir_seconds)
-    sw = stim.seg("sweep")
+    # one IR set per sweep level; the reference level carries the headline numbers
+    sw = stim.ref_sweep()
     f1, f2 = sw.meta["f1"], sw.meta["f2"]
-    f, H = analysis.spectrum(irs.linear, fs)
-    fr_f, fr_mag, fr_ph = analysis.smoothed_response(f, H, f1, f2)
-    harm = analysis.harmonic_response(irs, f1, f2)
+    per_level = {}
+    for seg in stim.sweeps():
+        ir_full, origin = analysis.deconvolve(stim, ya, seg)
+        irs_l = analysis.extract_harmonics(ir_full, origin, stim, max_order, ir_seconds, sweep=seg)
+        f, H = analysis.spectrum(irs_l.linear, fs)
+        g, m, ph = analysis.smoothed_response(f, H, f1, f2)
+        per_level[seg.meta["level_db"]] = {"irs": irs_l, "fr_f": g, "fr_mag_db": m, "fr_phase": ph,
+                                          "harm": analysis.harmonic_response(irs_l, f1, f2), "seg": seg}
+    ref = per_level[sw.meta["level_db"]]
+    irs, fr_f, fr_mag, fr_ph, harm = ref["irs"], ref["fr_f"], ref["fr_mag_db"], ref["fr_phase"], ref["harm"]
     tones = analysis.tone_metrics(stim, ya)
+    bursts = analysis.burst_metrics(stim, ya)
+    schedule = {k: [tuple(p) for p in v] for k, v in (meta.get("controls") or {}).items()}
+    ramps = analysis.ramp_metrics(stim, ya, schedule) if schedule else []
 
-    x_sw, y_sw = stim.cut(stim.signal, "sweep"), stim.cut(ya, "sweep")
+    # sweep-derived model and where it fails
+    models = [fit_hammerstein(v["irs"], lvl) for lvl, v in per_level.items()]
+    ref_model = next(m for m in models if m.level_db == sw.meta["level_db"])
+    yhat_ref = ref_model.apply(stim.signal)
+    res = {"ref_only": residual.localize(stim, ya, yhat_ref, ref_model.level_db)}
+    if len(models) > 1:
+        yhat_all = LevelIndexedModel(models).apply(stim.signal, fs)
+        res["all_levels"] = residual.localize(stim, ya, yhat_all, ref_model.level_db)
+        res["all_levels"]["levels_db"] = sorted(m.level_db for m in models)
+    (run_dir / "residual.json").write_text(json.dumps(res, indent=1, default=_json))
+    np.savez_compressed(run_dir / "model.npz", fs=fs, pre=ref_model.pre,
+                        levels_db=np.array([m.level_db for m in models]),
+                        **{f"kernels_{m.level_db:g}dB": m.kernels for m in models})
+
+    x_sw, y_sw = stim.cut(stim.signal, sw.name), stim.cut(ya, sw.name)
     noise = rms(stim.cut(ya, "pre")[int(0.1 * fs):])
-    tail = stim.cut(ya, "tail")
+    tail = ya[sw.stop : sw.stop + int(1.0 * fs)]
     an = {
         "fs": fs, "f1": f1, "f2": f2, "ir_linear": irs.linear, "ir_pre": irs.pre, "irs": irs.ir,
         "fr_f": fr_f, "fr_mag_db": fr_mag, "fr_phase": fr_ph, "harm": harm, "tones": tones,
+        "bursts": bursts, "per_level": per_level, "residual": res,
     }
     ref_1k = float(np.interp(1000.0, fr_f, fr_mag))
     metrics = {
@@ -86,7 +115,17 @@ def analyze_run(run_dir: Path, max_order: int = 5, ir_seconds: float = 0.2) -> d
                   "tail_rms_db": 20 * np.log10(rms(tail[len(tail) // 2:]) + 1e-30),
                   "snr_db": 20 * np.log10((rms(y_sw) + 1e-30) / (noise + 1e-30))},
         "harmonics_at_1k_db": {str(k): float(np.interp(1000.0, fin, rel)) for k, (fin, rel) in harm.items()},
+        "levels": {f"{lvl:g}": {"gain_1k_db": float(np.interp(1000.0, v["fr_f"], v["fr_mag_db"])),
+                                "harmonics_at_1k_db": {str(k): float(np.interp(1000.0, fin, rel)) for k, (fin, rel) in v["harm"].items()}}
+                   for lvl, v in per_level.items()},
         "spikes": analysis.spike_metrics(stim, ya),
+        "bursts": [{k: v for k, v in b.items() if not k.startswith(("envelope", "probe_envelope"))} for b in bursts],
+        "model": {"ref_level_db": ref_model.level_db, "order": ref_model.order,
+                  "clip_rsr_db": res["ref_only"].get("clip", {}).get("rsr_db"),
+                  "clip_rsr_all_levels_db": res.get("all_levels", {}).get("clip", {}).get("rsr_db"),
+                  "focus": res["ref_only"]["focus"],
+                  "focus_all_levels": res.get("all_levels", {}).get("focus")},
+        "ramps": ramps,
         "tones": tones,
     }
     (run_dir / "metrics.json").write_text(json.dumps(metrics, indent=1, default=_json))
@@ -99,6 +138,13 @@ def analyze_run(run_dir: Path, max_order: int = 5, ir_seconds: float = 0.2) -> d
     meta["alignment"] = al.as_dict()
     (run_dir / "run.json").write_text(json.dumps(meta, indent=1, default=_json))
     report.plot_run(an, run_dir, run_dir.name)
+    report.plot_residual(res, run_dir, run_dir.name)
+    if bursts:
+        report.plot_bursts(bursts, run_dir, run_dir.name)
+    if len(per_level) > 1:
+        report.plot_levels(per_level, run_dir, run_dir.name)
+    if ramps:
+        report.plot_ramps(ramps, run_dir, run_dir.name)
     return metrics
 
 
@@ -183,3 +229,62 @@ def compare_runs(run_a: Path, run_b: Path, out: Path, label_a: str | None = None
         summary["clip"] = {k: v for k, v in cmp["clip"].items() if k not in ("a", "b")}
     (out / "compare.json").write_text(json.dumps(summary, indent=1, default=_json))
     return summary
+
+
+# --------------------------------------------------------------------- grid
+def _cells(grid: dict[str, list[float]]) -> list[dict]:
+    import itertools
+    names = list(grid)
+    return [dict(zip(names, vals)) for vals in itertools.product(*(grid[n] for n in names))]
+
+
+def run_grid(stim_dir: Path, spec: str, sets: dict, grid: dict[str, list[float]], out: Path,
+             prompt: bool = False, **opts) -> Path:
+    """One sub-run per combination of grid values, analyzed, indexed in grid.json.
+    With prompt=True, waits for a human between cells (real knobs)."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    cells = _cells(grid)
+    index = []
+    for i, cell in enumerate(cells):
+        name = "_".join(f"{k}={v:g}" for k, v in cell.items())
+        if prompt:
+            input(f"[{i+1}/{len(cells)}] set {name.replace('_', ', ')} then press enter: ")
+        d = run_dut(stim_dir, spec, {**sets, **cell}, out / name, **opts)
+        m = analyze_run(d)
+        index.append({"cell": cell, "dir": str(d), "summary": summarize(m)})
+        print(f"[{i+1}/{len(cells)}] {name}: " + ", ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in index[-1]["summary"].items()))
+    (out / "grid.json").write_text(json.dumps({"grid": grid, "spec": spec, "sets": sets, "cells": index}, indent=1, default=_json))
+    surface(out)
+    return out
+
+
+def summarize(m: dict) -> dict:
+    """The numbers a knob map is drawn from."""
+    h = m["harmonics_at_1k_db"]
+    out = {"gain_1k_db": m["sweep"]["gain_1k_db"], "out_rms": m["sweep"]["out_rms"],
+           "h2_1k_db": h.get("2"), "h3_1k_db": h.get("3"),
+           "hf_drop_10k_db": m["sweep"]["mag_rel_1k_db"].get("10000"),
+           "clip_rsr_db": (m.get("model") or {}).get("clip_rsr_db"),
+           "spikes": m["spikes"]["count"]}
+    if m.get("bursts"):
+        out["sag_db"] = m["bursts"][0]["sag_db"]
+    return out
+
+
+def surface(grid_dir: Path) -> Path:
+    """grid.json -> surface.md table (+ heatmaps for two-parameter grids)."""
+    grid_dir = Path(grid_dir)
+    g = json.loads((grid_dir / "grid.json").read_text())
+    names = list(g["grid"])
+    keys = list(g["cells"][0]["summary"])
+    lines = [f"# knob surface: `{g['spec']}` over {', '.join(names)}", "",
+             "| " + " | ".join(names + keys) + " |", "|" + "---|" * (len(names) + len(keys))]
+    for c in g["cells"]:
+        vals = [f"{c['cell'][n]:g}" for n in names] + [("" if c["summary"][k] is None else f"{c['summary'][k]:.3g}") for k in keys]
+        lines.append("| " + " | ".join(vals) + " |")
+    if len(names) == 2:
+        figs = report.plot_surface(g, grid_dir)
+        lines += ["", "## Maps", ""] + [f"![{p.name}]({p.name})" for p in figs]
+    (grid_dir / "surface.md").write_text("\n".join(lines) + "\n")
+    return grid_dir / "surface.md"
